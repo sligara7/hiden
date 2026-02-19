@@ -2,14 +2,13 @@ from pathlib import PureWindowsPath
 import socket
 import time
 import logging
-from contextlib import closing
-import os
 
 # Logger setup
+# All logging flows through procServ's log management, which handles rotation and permissions correctly
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("massoft_client.log")]
+    handlers=[logging.StreamHandler()]
 )
 
 # System Configuration
@@ -54,19 +53,35 @@ class MASsoftSocket:
         self.sock.sendall(message.encode('utf-8'))
         if expect_response:
             try:
-                resp = self.sock.recv(4096).decode('utf-8').strip()
+                chunks = []
+                while True:
+                    chunk = self.sock.recv(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    if len(chunk) < 4096:
+                        break
+                resp = b''.join(chunks).decode('utf-8').strip()
+                return resp
             except socket.timeout:
-                logging.warning(f"{self.name} response timeout for: {message.strip()}")
+                logging.warning(f"{self.name} response timeout for:\n        {message.strip()}")
                 return ''
-            logging.info(f"{self.name} | {message.strip()} => {resp}")
-            return resp
         return ''
 
     def receive(self):
         if not self.sock:
             raise RuntimeError(f"{self.name} not connected.")
         try:
-            return self.sock.recv(4096).decode('utf-8').strip()
+            chunks = []
+            while True:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if len(chunk) < 4096:
+                    break
+            resp = b''.join(chunks).decode('utf-8').strip()
+            return resp
         except socket.timeout:
             return ''
 
@@ -146,7 +161,7 @@ class MASsoftClient:
             full_path = str(PureWindowsPath(EXPERIMENT_DIRECTORY) / file_name)
 
         # 2) Send to MASsoft
-        resp = self.status_socket_socket.send_command(f'-f"{full_path}"')
+        resp = self.status_socket.send_command(f'-f"{full_path}"')
         if resp =='0':
             raise RuntimeError(f"Failed to open experiment file: {full_path}")
 
@@ -231,7 +246,7 @@ class MASsoftClient:
         return legend, path
 
     def get_legends_data(self, view=1):
-        """Retrieve column legends via a temporary socket."""
+        """Retrieve column legends data via a temporary socket."""
         path = self.data_socket.send_command("-xFilename")
         time.sleep(1)
         path = self.data_socket.send_command("-xFilename")
@@ -246,7 +261,7 @@ class MASsoftClient:
                     time.sleep(1)
         except KeyboardInterrupt:
             print("Done.")
-        return legend_data
+        return legend, path
 
     def query_filename(self):
         """Return the filename currently associated with the command socket."""

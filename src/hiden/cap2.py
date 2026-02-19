@@ -1,11 +1,12 @@
+import argparse
 import asyncio
 import logging
-from pathlib import PureWindowsPath
+import sys
 
 from caproto import ChannelType
 from caproto.server import PVGroup, pvproperty, ioc_arg_parser, run
 
-from .massoft_client import MASsoftClient, EXPERIMENT_DIRECTORY, MOST_RECENT_FILE
+from .massoft_client import MASsoftClient
 
 logging.basicConfig(level=logging.INFO)
 
@@ -62,12 +63,12 @@ class RGAIOC(PVGroup):
         )
     del idx
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, mas_host='10.66.58.225', mas_port=5026, **kwargs):
         super().__init__(*args, **kwargs)
-        self.client    = MASsoftClient()
+        self.client = MASsoftClient(host=mas_host, port=mas_port)
         self.client.initialize()
-        self._running  = False
-        self._task     = None
+        self._running = False
+        self._task = None
         self._mass_vals = []  # store legends
 
     @open_exp.putter
@@ -107,11 +108,12 @@ class RGAIOC(PVGroup):
         """Read all channels once per second until stopped."""
         try:
             # Parses RGA data headers into PVs
-            headers, path = self.client.get_legends(1)
+            loop = asyncio.get_running_loop()
+            headers, path = await loop.run_in_executor(None, self.client.get_legends, 1)
             mass_values = [
                 float(h.split()[-1])
                 for h in headers
-                if 'mass' in h
+                if 'mass' in h.lower()
             ]
             # print('Mass values: {}'.format(mass_values))
             for idx, mass_val in enumerate(mass_values[:10], start=1):
@@ -120,12 +122,12 @@ class RGAIOC(PVGroup):
                 await pv.write(mass_val)
                 logging.debug(f"Wrote {mass_val:.2f} to {pv.name}")
 
-            self.client.open_experiment_data(path)
+            await loop.run_in_executor(None, self.client.open_experiment_data, path)
             while self._running:
                 print(self._running)
                 # print('Trying......')
                 try:
-                    raw_data = self.client.data_socket.send_command(f"-lData -v1")
+                    raw_data = await loop.run_in_executor(None, self.client.data_socket.send_command, "-lData -v1")
                     if raw_data != '0':
                         lines = raw_data.strip().split('\r\n')
                         # print(f'Lines: {lines}')
@@ -146,10 +148,17 @@ class RGAIOC(PVGroup):
                                     await pv.write(float(val))
                                     logging.debug(f'Wrote {val} to {pv.name}')
                 except Exception as e:
-                    print(f"Caught an exception: {e}")
-                    if str(e).startswith('[Errno 32]'):
-                        self._running = 0
-
+                    logging.error(f"Socket error during acquisition: {e}")
+                    self.client.data_socket.close()
+                    # Retry reconnection up to N times
+                    for attempt in range(5):
+                        try:
+                            self.client.data_socket.connect()
+                            logging.info("Reconnected data socket")
+                            break  # success — back to the while loop
+                        except Exception as reconnect_err:
+                            logging.error(f"Reconnect attempt {attempt+1} failed:\n{reconnect_err}")
+                            await asyncio.sleep(5)
                 await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             logging.info("Acquisition loop cancelled")
@@ -167,31 +176,42 @@ class RGAIOC(PVGroup):
     @abort_exp.putter
     async def abort_exp(self, instance, value):
         """Write 1 to abort the running experiment, always resets to 0."""
-        self.client.shutdown()
-        self.client.initialize()
-        self.client.command_socket.send_command('-f"%HIDEN_LastFile%"')
-        path = self.client.command_socket.send_command('-xFilename')
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.client.shutdown)
+        await loop.run_in_executor(None, self.client.initialize)
+        await loop.run_in_executor(None, self.client.command_socket.send_command, '-f"%HIDEN_LastFile%"')
+        path = await loop.run_in_executor(None, self.client.command_socket.send_command, '-xFilename')
         # print(f'Aborting experiment: {path}')
         want = bool(int(value))
         if want:
-            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self.client.abort_experiment)
         return value
 
     @close_exp.putter
     async def close_exp(self, instance, value):
-        self.client.command_socket.send_command('-f"%HIDEN_LastFile%"')
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.client.command_socket.send_command, '-f"%HIDEN_LastFile%"')
         want = bool(int(value))
         if want:
-            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self.client.close_experiment)
         return value
 
 
 if __name__ == '__main__':
+    # Parse MASsoft connection arguments
+    parser = argparse.ArgumentParser(description='RGA MASsoft IOC')
+    parser.add_argument('--mas-host', default='10.66.58.225',
+                        help='MASsoft host address (default: 10.66.58.225)')
+    parser.add_argument('--mas-port', type=int, default=5026,
+                        help='MASsoft port number (default: 5026)')
+    args, remaining = parser.parse_known_args(sys.argv[1:])
+    
+    # Let caproto parse its own arguments from remaining args
+    sys.argv = [sys.argv[0]] + remaining
     ioc_opts, run_opts = ioc_arg_parser(
         default_prefix='',  # PV names include the {{RGA:1}} macro literally
         desc='RGA MASsoft IOC'
     )
-    ioc = RGAIOC(**ioc_opts)
+    
+    ioc = RGAIOC(mas_host=args.mas_host, mas_port=args.mas_port, **ioc_opts)
     run(ioc.pvdb, **run_opts)
