@@ -5,7 +5,6 @@ import asyncio
 import logging
 import sys
 
-from caproto import ChannelType
 from caproto.server import PVGroup, ioc_arg_parser, pvproperty, run
 
 from .massoft_client import MASsoftClient
@@ -18,14 +17,14 @@ class RGAIOC(PVGroup):
     open_exp = pvproperty(
         name="XF:08IDB-SE{{RGA:1}}:OpenExp",
         value=0,
-        dtype=int,
         doc="Write 1 to open the experiment file",
+        dtype=int,
     )
 
-    experiment_name = pvproperty(
+    experiment = pvproperty(
         name="XF:08IDB-SE{{RGA:1}}:ExpName",
-        value="file1.exp",
-        dtype=ChannelType.STRING,
+        value="file56.exp",
+        dtype=str,
         max_length=64,
         doc="Name of the .exp file in MASsoft folder",
     )
@@ -33,8 +32,8 @@ class RGAIOC(PVGroup):
     acquire = pvproperty(
         name="XF:08IDB-SE{{RGA:1}}:Acquire",
         value=0,
-        dtype=int,
         doc="Start/stop the acquisition loop",
+        dtype=int,
     )
 
     run_exp = pvproperty(
@@ -58,19 +57,23 @@ class RGAIOC(PVGroup):
         doc="Write 1 to close the experiment file",
     )
 
-    # -- MID-I & Mass PVs (1-10) --
+    # -- MID-I readback PVs (1-10) --
     for idx in range(1, 11):
         locals()[f"mid{idx}"] = pvproperty(
             name=f"XF:08IDB-SE{{{{RGA:1}}}}P:MID{idx}-I",
             value=0.0,
-            dtype=float,
             doc=f"RGA reading for MID{idx}",
+            dtype=float,
         )
+    del idx
+
+    # -- Mass PVs (1-10) --
+    for idx in range(1, 11):
         locals()[f"mass{idx}"] = pvproperty(
             name=f"XF:08IDB-VA{{{{RGA:1}}}}Mass:MID{idx}",
             value=0.0,
-            dtype=float,
             doc=f"RGA mass for MID{idx}",
+            dtype=float,
         )
     del idx
 
@@ -79,53 +82,56 @@ class RGAIOC(PVGroup):
         self.client = MASsoftClient(host=mas_host, port=mas_port)
         self.client.initialize()
         self._running = False
-        self._task = None
-        self._mass_vals = []  # store legends
+        self._acq_task = None
 
     @open_exp.putter
-    async def open_exp(self, _instance, value):
-        want = bool(int(value))
-        if want:
-            fn = self.experiment_name.value
-            if isinstance(fn, (list, tuple)):
-                fn = fn[0]
+    async def open_exp(self, instance, value):
+        """Open the experiment file when PV is set to 1."""
+        if int(value):
+            fname = self.experiment.value
+            if isinstance(fname, (list, tuple)):
+                fname = fname[0]
+            logging.info(f"Opening experiment: {fname}")
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self.client.open_experiment_commands, fn)
-        return value
-
-    @experiment_name.putter
-    async def experiment_name(self, _instance, value):
+            await loop.run_in_executor(None, self.client.open_experiment_commands, fname)
         return value
 
     @acquire.putter
-    async def acquire(self, _instance, value):
-        """Triggered when someone writes to the START PV."""
-        want_acquire = bool(int(value))
-        if want_acquire and not self._running:
+    async def acquire(self, instance, value):
+        """Start/stop acquisition loop on 'acquire' PV change."""
+        want = bool(int(value))
+
+        if want and not self._running:
             logging.info("Starting acquisition loop")
             self._running = True
-            # spawn background task
-            self._task = asyncio.create_task(self._acquire_loop())
-        elif not want_acquire and self._running:
+            self._acq_task = asyncio.create_task(self._acquire_loop())
+        elif not want and self._running:
             logging.info("Stopping acquisition loop")
             self._running = False
-            if self._task:
-                self._task.cancel()
+            if self._acq_task:
+                self._acq_task.cancel()
         return value
 
     async def _acquire_loop(self):
-        """Read all channels once per second until stopped."""
+        """1 Hz loop: pull headers, then data, and update PVs."""
         try:
-            # Parses RGA data headers into PVs
             loop = asyncio.get_running_loop()
-            headers, path = await loop.run_in_executor(None, self.client.get_legends, 1)
-            mass_values = [float(h.split()[-1]) for h in headers if "mass" in h.lower()]
-            for idx, mass_val in enumerate(mass_values[:10], start=1):
-                pv = getattr(self, f"mass{idx}")
-                await pv.write(mass_val)
-                logging.debug("Wrote %.2f to %s", mass_val, pv.name)
 
+            # 1) Get and parse legends -> mass PVs
+            headers, path = await loop.run_in_executor(
+                None, self.client.get_legends, 1
+            )
+            mass_vals = [
+                float(h.split()[-1]) for h in headers if "mass" in h.lower()
+            ][:10]
+            logging.info(f"Parsed masses: {mass_vals}")
+            for idx, m in enumerate(mass_vals, start=1):
+                await getattr(self, f"mass{idx}").write(m)
+
+            # 2) Associate the data socket with the experiment file
             await loop.run_in_executor(None, self.client.open_experiment_data, path)
+
+            # 3) Main data loop
             while self._running:
                 try:
                     raw_data = await loop.run_in_executor(
@@ -137,66 +143,51 @@ class RGAIOC(PVGroup):
                             if line.strip() == "0":
                                 continue
                             values = line.split()[2:]
-                            if len(values) == len(mass_values):
-                                for idx, val in enumerate(values):
-                                    pv = getattr(self, f"mid{idx + 1}")
-                                    await pv.write(float(val))
-                                    logging.debug("Wrote %s to %s", val, pv.name)
+                            if len(values) >= len(mass_vals):
+                                for idx, val in enumerate(values[:len(mass_vals)], start=1):
+                                    await getattr(self, f"mid{idx}").write(float(val))
                 except Exception as e:
-                    logging.error("Socket error during acquisition: %s", e)
+                    logging.error(f"Socket error during acquisition: {e}")
                     self.client.data_socket.close()
-                    # Retry reconnection up to N times
+                    # Retry reconnection up to 5 times
                     for attempt in range(5):
                         try:
                             self.client.data_socket.connect()
                             logging.info("Reconnected data socket")
-                            break  # success - back to the while loop
+                            break
                         except Exception as reconnect_err:
                             logging.error(
-                                "Reconnect attempt %d failed:\n%s",
-                                attempt + 1,
-                                reconnect_err,
+                                f"Reconnect attempt {attempt + 1} failed: {reconnect_err}"
                             )
                             await asyncio.sleep(5)
                 await asyncio.sleep(1.0)
+
         except asyncio.CancelledError:
             logging.info("Acquisition loop cancelled")
-            return
+        except Exception as ex:
+            logging.error(f"Error in acquisition loop: {ex}")
 
     @run_exp.putter
-    async def run_exp(self, _instance, value):
-        want = bool(int(value))
-        if want:
+    async def run_exp(self, instance, value):
+        """Write 1 to start the experiment."""
+        if int(value):
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self.client.run_experiment)
-
         return value
 
     @abort_exp.putter
-    async def abort_exp(self, _instance, value):
-        """Write 1 to abort the running experiment, always resets to 0."""
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self.client.shutdown)
-        await loop.run_in_executor(None, self.client.initialize)
-        await loop.run_in_executor(
-            None, self.client.command_socket.send_command, '-f"%HIDEN_LastFile%"'
-        )
-        await loop.run_in_executor(
-            None, self.client.command_socket.send_command, "-xFilename"
-        )
-        want = bool(int(value))
-        if want:
+    async def abort_exp(self, instance, value):
+        """Write 1 to abort the running experiment."""
+        if int(value):
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self.client.abort_experiment)
         return value
 
     @close_exp.putter
-    async def close_exp(self, _instance, value):
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, self.client.command_socket.send_command, '-f"%HIDEN_LastFile%"'
-        )
-        want = bool(int(value))
-        if want:
+    async def close_exp(self, instance, value):
+        """Write 1 to close the experiment file."""
+        if int(value):
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self.client.close_experiment)
         return value
 
@@ -217,7 +208,7 @@ if __name__ == "__main__":
     # Let caproto parse its own arguments from remaining args
     sys.argv = [sys.argv[0], *remaining]
     ioc_opts, run_opts = ioc_arg_parser(
-        default_prefix="",  # PV names include the {{RGA:1}} macro literally
+        default_prefix="",  # PV names include the full prefix already
         desc="RGA MASsoft IOC",
     )
 
