@@ -1,0 +1,38 @@
+{
+  "beamline_name": "08IDB",
+  "massoft": {
+    "host": "10.66.58.225",
+    "port": 5026,
+    "experiment_directory": "C:\\Users\\08id-user\\Documents\\Hiden Analytical\\MASsoft\\11",
+    "retry_s": 15,
+    "command_timeout_s": 20.0,
+    "link_chunk_timeout_s": 1.0,
+    "link_burst_gap_s": 0.1,
+    "enable_keepalive": true
+  },
+  "ioc": {
+    "default_experiment": "file56.exp",
+    "default_view": 1,
+    "update_period_s": 1.0,
+    "default_go_od": 1,
+    "default_go_ot": 1,
+    "default_go_filename": "",
+    "start_links_on_open_exp": 0,
+    "default_data_cycles": 1,
+    "default_data_time_fmt": 0,
+    "default_data_ms_fmt": 0
+  },
+  "archiver": {
+    "sampling_mode": "Monitor",
+    "sampling_period_s": 1.0,
+    "condition_pv": "XF:08IDB-SE{RGA:1}:Acquire"
+  },
+  "epics": {
+    "ca_server_port": 5064,
+    "ca_repeater_port": 5065,
+    "ca_addr_list": "10.66.59.255",
+    "ca_auto_addr_list": "NO",
+    "cas_auto_beacon_addr_list": "NO",
+    "cas_beacon_addr_list": "10.66.59.255"
+  }
+}
