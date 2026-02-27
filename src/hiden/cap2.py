@@ -5,7 +5,8 @@ Combines the working version's reliability patterns (eager connect, polling
 fallback with reconnect retry) with the rewrite's protocol-correct hot-link
 threads and diagnostic PVs.
 
-PV names use the working-version convention: RunExp, AbortExp, CloseExp.
+Provides both working-version PVs (RunExp, AbortExp, CloseExp) and rewrite
+PVs (Go, Abort, Close) for backward compatibility.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import time
 
 from caproto.server import PVGroup, ioc_arg_parser, pvproperty, run
 
-from .massoft_client import MASsoftClient, load_runtime_config
+from .massoft_client import MASsoftClient, MASsoftTimeout, load_runtime_config
 
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO)
@@ -85,6 +86,27 @@ class RGAIOC(PVGroup):
         value=0,
         dtype=int,
         doc="Write 1 to close the experiment file",
+    )
+
+    go = pvproperty(
+        name="XF:08IDB-SE{{RGA:1}}:Go",
+        value=0,
+        dtype=int,
+        doc="Momentary: -xGo (run experiment). Uses GoOD/GoOT and GoFilename.",
+    )
+
+    abort = pvproperty(
+        name="XF:08IDB-SE{{RGA:1}}:Abort",
+        value=0,
+        dtype=int,
+        doc="Momentary: -xAbort and wait for Stopped* status.",
+    )
+
+    close = pvproperty(
+        name="XF:08IDB-SE{{RGA:1}}:Close",
+        value=0,
+        dtype=int,
+        doc="Momentary: safe close (abort->wait for Stopped*->-xClose).",
     )
 
     # -----------------------------------------------------------------
@@ -296,6 +318,65 @@ class RGAIOC(PVGroup):
             LOG.exception("CloseExp failed")
             await self.last_error.write(repr(exc))
 
+        return 0
+
+    @go.putter
+    async def go(self, instance, value):
+        """Momentary: start experiment using GoOD/GoOT/GoFilename config PVs."""
+        if not int(value):
+            return value
+        try:
+            od = bool(int(self.go_od.value))
+            ot = bool(int(self.go_ot.value))
+            fn = (self.go_filename.value or "").strip() or None
+            await asyncio.to_thread(self.client.x_go, filename=fn, od=od, ot=ot)
+        except Exception as exc:
+            LOG.exception("Go failed")
+            await self.last_error.write(repr(exc))
+        return 0
+
+    @abort.putter
+    async def abort(self, instance, value):
+        """Momentary: abort and wait for Stopped* status."""
+        if not int(value):
+            return value
+        try:
+            final = await asyncio.to_thread(
+                self.client.safe_abort_and_wait,
+                timeout_s=30.0,
+            )
+            await self.status.write(final)
+        except MASsoftTimeout as exc:
+            await self.last_error.write(repr(exc))
+        except Exception as exc:
+            LOG.exception("Abort failed")
+            await self.last_error.write(repr(exc))
+        return 0
+
+    @close.putter
+    async def close(self, instance, value):
+        """Momentary: safe abort->wait->close. MASsoft drops all file sockets."""
+        if not int(value):
+            return value
+        try:
+            self._running = False
+            if self._acq_task is not None:
+                self._acq_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._acq_task
+                self._acq_task = None
+
+            await asyncio.to_thread(
+                self.client.safe_abort_and_close,
+                abort_timeout_s=30.0,
+                reconnect=False,
+            )
+            self._links_started = False
+            await self.connected.write(0)
+            await self.status.write("Disconnected")
+        except Exception as exc:
+            LOG.exception("Close failed")
+            await self.last_error.write(repr(exc))
         return 0
 
     @acquire.putter
